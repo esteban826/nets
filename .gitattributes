@@ -1,0 +1,4 @@
+# Los scripts se ejecutan en Linux. Con CRLF el shebang falla con un
+# "bad interpreter: No such file or directory" que no dice nada util.
+* text=auto eol=lf
+*.sh text eol=lf
