@@ -34,7 +34,7 @@
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-RANGOS_POR_DEFECTO="10.255.0.0/16 172.20.0.0/16"
+RANGOS_POR_DEFECTO="10.255.0.0/16 10.20.0.0/16"
 
 if [ -t 1 ]; then
   C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[0;33m'
