@@ -35,7 +35,16 @@
 set -uo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="1.0"
+VERSION="1.1"
+# Historial:
+#   1.1  El bloqueante de virtualizacion ya no se dispara cuando el modulo
+#        wireguard esta cargado. Un LXC no puede hacer modprobe, pero si el
+#        anfitrion ya tiene el modulo, el contenedor si puede crear
+#        interfaces wg en su namespace. La version 1.0 daba "NO apto" sobre
+#        sistemas que si lo eran, y se contradecia dos lineas mas abajo.
+#        La rama de iptables distinguia mal "no instalado" de "sin root":
+#        reportaba siempre lo segundo.
+#   1.0  Version inicial.
 
 # Valores del diseno. Cambiarlos aqui si cambia el proyecto.
 MTU_TUNEL=1420
@@ -154,46 +163,59 @@ VIRT="desconocida"
 hay systemd-detect-virt && VIRT="$(systemd-detect-virt 2>/dev/null || echo ninguna)"
 dato "Virtualizacion: ${VIRT}"
 
+ES_CONTENEDOR=0
 case "$VIRT" in
-  openvz|lxc|lxc-libvirt|docker|podman|wsl)
-    bloquea "Virtualizacion ${VIRT}: el contenedor comparte el kernel del anfitrion y no puede cargar modulos."
-    nota "Salida posible: WireGuard en userspace (wireguard-go o boringtun)."
-    nota "Requiere /dev/net/tun expuesto y el proveedor tiene que permitirlo."
-    ;;
-  kvm|qemu|vmware|microsoft|xen|amazon|oracle|bochs|parallels|none|ninguna)
-    ok "Virtualizacion ${VIRT}: admite modulos de kernel propios."
-    ;;
-  *) indet "Virtualizacion no reconocida: ${VIRT}" ;;
+  openvz|lxc|lxc-libvirt|docker|podman|wsl) ES_CONTENEDOR=1 ;;
 esac
 
+# La pregunta correcta es "hay WireGuard USABLE?", no "se pueden cargar
+# modulos?". Un contenedor no puede hacer modprobe, pero si el anfitrion ya
+# tiene el modulo cargado, puede crear interfaces wg en su propio namespace
+# de red. Evaluar la virtualizacion sin mirar antes el estado del modulo
+# produce un "no apto" sobre un sistema que si lo es.
 MODULO_OK=0
-if [ -d /sys/module/wireguard ]; then
-  ok "El modulo wireguard YA esta cargado."
-  MODULO_OK=1
-elif grep -q '^wireguard ' /proc/modules 2>/dev/null; then
-  ok "wireguard presente en /proc/modules."
+MODULO_CARGABLE=0
+if [ -d /sys/module/wireguard ] || grep -q '^wireguard ' /proc/modules 2>/dev/null; then
+  ok "El modulo wireguard YA esta cargado en el kernel."
   MODULO_OK=1
 elif [ -f "/boot/config-${KVER}" ] && grep -q '^CONFIG_WIREGUARD=y' "/boot/config-${KVER}" 2>/dev/null; then
   ok "WireGuard compilado dentro del kernel (CONFIG_WIREGUARD=y). No hace falta modulo."
   MODULO_OK=1
 elif hay modinfo && modinfo wireguard >/dev/null 2>&1; then
-  ok "Modulo wireguard disponible para cargar: $(modinfo -n wireguard 2>/dev/null || echo presente)"
-  MODULO_OK=1
-else
-  if es_root; then
-    if [ "$PROBAR_MODULO" -eq 1 ]; then
-      if modprobe wireguard 2>/dev/null; then
-        ok "modprobe wireguard cargo el modulo correctamente."
-        MODULO_OK=1
-      else
-        bloquea "modprobe wireguard fallo. Este kernel no puede ofrecer WireGuard nativo."
-      fi
-    else
-      indet "No encuentro el modulo por inspeccion. Reejecutar con --probar-modulo para la prueba definitiva."
-    fi
+  # El archivo del modulo existe, pero eso solo sirve si se puede cargar.
+  MODULO_CARGABLE=1
+fi
+
+if [ "$MODULO_OK" -eq 1 ]; then
+  if [ "$ES_CONTENEDOR" -eq 1 ]; then
+    ok "Virtualizacion ${VIRT}: el modulo ya esta cargado en el anfitrion, asi que este contenedor puede crear interfaces WireGuard."
+    nota "Queda confirmar CAP_NET_ADMIN. Prueba reversible, no deja nada:"
+    nota "  ip link add wgtest type wireguard && ip link del wgtest"
   else
-    indet "Sin root no puedo inspeccionar los modulos del kernel."
+    ok "Virtualizacion ${VIRT}: sin restricciones para WireGuard."
   fi
+elif [ "$MODULO_CARGABLE" -eq 1 ]; then
+  if [ "$ES_CONTENEDOR" -eq 1 ]; then
+    bloquea "El modulo existe pero no esta cargado, y en ${VIRT} no se puede hacer modprobe desde adentro."
+    nota "Se resuelve en el ANFITRION, no aqui:  modprobe wireguard"
+  else
+    ok "Modulo wireguard disponible para cargar: $(modinfo -n wireguard 2>/dev/null || echo presente)"
+  fi
+elif [ "$ES_CONTENEDOR" -eq 1 ]; then
+  bloquea "Sin WireGuard cargado, y en ${VIRT} no se puede cargar desde adentro."
+  nota "Verificar en el anfitrion:  lsmod | grep -i wireguard"
+  nota "Alternativa si el anfitrion no lo tiene: WireGuard en userspace (wireguard-go, boringtun)."
+elif es_root && [ "$PROBAR_MODULO" -eq 1 ]; then
+  if modprobe wireguard 2>/dev/null; then
+    ok "modprobe wireguard cargo el modulo correctamente."
+    MODULO_OK=1
+  else
+    bloquea "modprobe wireguard fallo. Este kernel no puede ofrecer WireGuard nativo."
+  fi
+elif es_root; then
+  indet "No encuentro el modulo por inspeccion. Reejecutar con --probar-modulo para la prueba definitiva."
+else
+  indet "Sin root no puedo inspeccionar los modulos del kernel."
 fi
 
 if [ -c /dev/net/tun ]; then
@@ -311,7 +333,13 @@ if hay iptables; then
   esac
 fi
 
-if es_root && hay iptables; then
+if ! hay iptables; then
+  # No confundir "no instalado" con "no pude leerlo". Son dos cosas distintas
+  # y la version anterior reportaba siempre la segunda.
+  dato "iptables no instalado. No hay reglas que revisar en esa capa."
+elif ! es_root; then
+  indet "Sin root no puedo leer las reglas de iptables."
+else
   for cadena in INPUT OUTPUT FORWARD; do
     POL="$(iptables -S "$cadena" 2>/dev/null | awk -v c="$cadena" '$1=="-P" && $2==c {print $3; exit}')"
     case "${POL:-?}" in
@@ -327,8 +355,6 @@ if es_root && hay iptables; then
   done
   N_REGLAS="$(iptables -S 2>/dev/null | grep -c '^-A' || true)"
   dato "Reglas iptables activas: ${N_REGLAS:-0}"
-else
-  indet "Sin root no puedo leer las reglas de iptables."
 fi
 
 if hay systemctl; then
