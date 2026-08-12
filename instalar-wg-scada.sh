@@ -46,8 +46,13 @@ set -euo pipefail
 # aunque esten instaladas.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="1.6"
+VERSION="1.7"
 # Historial:
+#   1.7  --breve pasa a imprimir dos lineas CLAVE=VALOR y nada mas. Sin
+#        titulo, sin aviso, sin IP overlay: lo que se pide por telefono o por
+#        chat entra en un solo mensaje y no hay que explicar que copiar.
+#        El formato NOMBRE=valor ademas se puede pegar en un archivo y
+#        leerlo con source, o filtrarlo con grep sin recortar prefijos.
 #   1.6  Nuevo --breve: al terminar imprime solo los datos que hay que llevar
 #        al concentrador (clave publica, PSK e IP overlay) y omite el bloque
 #        RouterOS y el "Siguiente paso". Pensado para cuando lo ejecuta un
@@ -171,12 +176,15 @@ OPCIONES
   --sin-firewall          NO aplica politica local al tunel. La interfaz sube
                           sin PostUp/PostDown y sin tabla nftables propia.
                           Usar solo si el filtrado se hace en el concentrador
-  --breve                 Al terminar imprime solo la clave publica, la PSK y
-                          la IP overlay. Omite el bloque para pegar en el
-                          RB5009 y el resumen de pasos siguientes. Util cuando
-                          lo ejecuta un tercero que solo debe devolver esos
-                          datos, o cuando el peer ya existe en el hub y hay
-                          que actualizarlo con /peers/set en vez de /peers/add
+  --breve                 Al terminar imprime solo dos lineas:
+                            PUBLIC-KEY=...
+                            PRESHARED-KEY=...
+                          Omite el bloque para pegar en el RB5009 y el resumen
+                          de pasos siguientes. Util cuando lo ejecuta un
+                          tercero que solo debe devolver esos dos valores, o
+                          cuando el peer ya existe en el hub y hay que
+                          actualizarlo con /peers/set en vez de /peers/add.
+                          La PSK es secreta: tratarla como una contrasena
   --verificar             Solo ejecuta el diagnostico
   --desinstalar           Revierte la instalacion
   --ayuda                 Esta ayuda
@@ -807,17 +815,10 @@ imprimir_peer_routeros() {
   fi
   local ip_sola="${IP_OVERLAY%%/*}"
 
-  # Salida minima: solo lo que hay que llevar al concentrador. Se imprime con
-  # etiquetas fijas y sin adornos para que se pueda copiar de a una linea.
+  # Salida minima: dos lineas CLAVE=VALOR y nada mas. Sin titulo ni aviso,
+  # para que se puedan copiar de una sola pasada y pegarse tal cual.
   if [ "$BREVE" -eq 1 ]; then
-    titulo "Datos para el concentrador"
-    cat <<FIN
-  Clave publica : ${MI_PUBKEY}
-  PSK           : ${MI_PSK}
-  IP overlay    : ${ip_sola}/32
-
-FIN
-    warn "La PSK es secreta. Guardala en el gestor de secretos y limpia el historial de la terminal."
+    printf '\nPUBLIC-KEY=%s\nPRESHARED-KEY=%s\n' "${MI_PUBKEY}" "${MI_PSK}"
     return 0
   fi
 
