@@ -46,8 +46,15 @@ set -euo pipefail
 # aunque esten instaladas.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="1.7"
+VERSION="1.8"
 # Historial:
+#   1.8  --desinstalar podia informar exito con el tunel todavia arriba. El
+#        'systemctl stop ... || true' se tragaba el fallo de wg-quick down,
+#        que necesita leer el .conf: si el .conf ya no estaba, la interfaz
+#        seguia levantada y cifrando, con el .conf y las claves ya borrados.
+#        Ahora, si la interfaz sobrevive al stop, se elimina con ip link del
+#        (no depende de ningun archivo) y al final se verifica que no exista
+#        antes de dar el OK.
 #   1.7  --breve pasa a imprimir dos lineas CLAVE=VALOR y nada mas. Sin
 #        titulo, sin aviso, sin IP overlay: lo que se pide por telefono o por
 #        chat entra en un solo mensaje y no hay que explicar que copiar.
@@ -996,9 +1003,27 @@ desinstalar() {
   respaldar
   ejecutar "systemctl stop wg-quick@${IFACE}.service 2>/dev/null || true"
   ejecutar "systemctl disable wg-quick@${IFACE}.service 2>/dev/null || true"
+
+  # El 'systemctl stop' de arriba lleva '|| true' para no abortar cuando el
+  # servicio ni siquiera existe, pero eso tambien tapa un fallo real: wg-quick
+  # down lee el .conf para saber que desarmar, y si alguien lo borro a mano
+  # antes de desinstalar, la baja no ocurre y la interfaz queda arriba pasando
+  # trafico. Se comprueba y se elimina directamente, que no depende del .conf.
+  if [ "$DRY_RUN" -eq 0 ] && ip link show "${IFACE}" >/dev/null 2>&1; then
+    warn "La interfaz ${IFACE} sigue arriba despues de detener el servicio."
+    warn "Suele pasar si el .conf fue borrado a mano: wg-quick down no pudo leerlo."
+    ejecutar "ip link del '${IFACE}'"
+  fi
+
   ejecutar "nft delete table inet ${NFT_TABLA} 2>/dev/null || true"
   ejecutar "rm -f '${NFT_FILE}'"
   ejecutar "mv '${CONF}' '${BACKUP_DIR}/${IFACE}.conf.desinstalado.${STAMP}' 2>/dev/null || true"
+
+  # Sin esta comprobacion el script podria informar exito con el tunel vivo.
+  if [ "$DRY_RUN" -eq 0 ] && ip link show "${IFACE}" >/dev/null 2>&1; then
+    die "La interfaz ${IFACE} sigue existiendo. Eliminala a mano: ip link del ${IFACE}"
+  fi
+
   ok "Cliente desinstalado. Las claves siguen en ${WG_DIR} por si hay que reinstalar."
   info "Para borrar tambien las claves: rm -f ${WG_DIR}/${IFACE}-*.key"
   echo
