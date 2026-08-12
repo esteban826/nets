@@ -46,8 +46,15 @@ set -euo pipefail
 # aunque esten instaladas.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-VERSION="1.5"
+VERSION="1.6"
 # Historial:
+#   1.6  Nuevo --breve: al terminar imprime solo los datos que hay que llevar
+#        al concentrador (clave publica, PSK e IP overlay) y omite el bloque
+#        RouterOS y el "Siguiente paso". Pensado para cuando lo ejecuta un
+#        tercero que solo tiene que devolver esos dos valores: menos texto
+#        que leer, menos posibilidad de que copie el bloque equivocado.
+#        El bloque completo con /peers/add sirve para el alta inicial, pero
+#        induce a error cuando el peer ya existe: ahi corresponde /peers/set.
 #   1.5  Nuevo --sin-firewall: el cliente levanta el tunel sin politica local
 #        y el filtrado queda a cargo del concentrador RB5009. Pensado para
 #        servidores donde no se quiere ninguna regla local, o donde no hay
@@ -100,6 +107,7 @@ KEEPALIVE=25
 DRY_RUN=0
 ASUMIR_SI=0
 SIN_FIREWALL=0              # 1 = no aplicar politica local, se hace en el hub
+BREVE=0                     # 1 = al final, solo las claves y la IP overlay
 ACCION="instalar"
 
 WG_DIR="/etc/wireguard"
@@ -163,6 +171,12 @@ OPCIONES
   --sin-firewall          NO aplica politica local al tunel. La interfaz sube
                           sin PostUp/PostDown y sin tabla nftables propia.
                           Usar solo si el filtrado se hace en el concentrador
+  --breve                 Al terminar imprime solo la clave publica, la PSK y
+                          la IP overlay. Omite el bloque para pegar en el
+                          RB5009 y el resumen de pasos siguientes. Util cuando
+                          lo ejecuta un tercero que solo debe devolver esos
+                          datos, o cuando el peer ya existe en el hub y hay
+                          que actualizarlo con /peers/set en vez de /peers/add
   --verificar             Solo ejecuta el diagnostico
   --desinstalar           Revierte la instalacion
   --ayuda                 Esta ayuda
@@ -238,6 +252,7 @@ while [ $# -gt 0 ]; do
     --dry-run)        DRY_RUN=1; shift ;;
     --si)             ASUMIR_SI=1; shift ;;
     --sin-firewall)   SIN_FIREWALL=1; shift ;;
+    --breve)          BREVE=1; shift ;;
     --verificar)      ACCION="verificar"; shift ;;
     --desinstalar)    ACCION="desinstalar"; shift ;;
     --ayuda|-h|--help) ayuda; exit 0 ;;
@@ -792,6 +807,20 @@ imprimir_peer_routeros() {
   fi
   local ip_sola="${IP_OVERLAY%%/*}"
 
+  # Salida minima: solo lo que hay que llevar al concentrador. Se imprime con
+  # etiquetas fijas y sin adornos para que se pueda copiar de a una linea.
+  if [ "$BREVE" -eq 1 ]; then
+    titulo "Datos para el concentrador"
+    cat <<FIN
+  Clave publica : ${MI_PUBKEY}
+  PSK           : ${MI_PSK}
+  IP overlay    : ${ip_sola}/32
+
+FIN
+    warn "La PSK es secreta. Guardala en el gestor de secretos y limpia el historial de la terminal."
+    return 0
+  fi
+
   titulo "Pegar en el RB5009 (RouterOS v7)"
   cat <<FIN
 
@@ -1030,6 +1059,7 @@ main() {
       fi
       habilitar_servicio
       imprimir_peer_routeros
+      [ "$BREVE" -eq 1 ] && exit 0
       titulo "Siguiente paso"
       cat <<FIN
   1. Da de alta el peer en el RB5009 con el bloque de arriba.
