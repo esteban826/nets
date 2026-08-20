@@ -53,11 +53,23 @@
     borras, una reinstalacion genera identidad nueva y hay que actualizar el peer
     en el RB5009.
 
+.PARAMETER QuitarWireGuard
+    Junto con -Desinstalar, desinstala ademas el propio cliente WireGuard y
+    borra el directorio de datos completo. Deja la PC como estaba antes.
+    Pensado para equipos de prueba.
+
 .PARAMETER Estado
     Muestra el estado del tunel y las rutas que instalo, y termina.
 
 .PARAMETER MsiPath
     Ruta a un MSI de WireGuard ya descargado, para equipos sin salida a internet.
+
+.PARAMETER PermitirIcmp
+    Crea una regla de entrada en el Firewall de Windows que acepta echo request
+    (ping) desde las redes del tunel, para que el SCADA y el hub puedan
+    supervisar la PC. Es lo unico que este script toca del firewall, y solo si
+    se lo pide explicitamente. La regla queda acotada al adaptador del tunel y
+    a los mismos prefijos de AllowedIPs: nada mas.
 
 .PARAMETER SinWatchdog
     No instala la tarea programada de vigilancia. El servicio igual queda en
@@ -112,6 +124,9 @@ param(
     [switch]$Breve,
 
     [Parameter(ParameterSetName = 'Instalar')]
+    [switch]$PermitirIcmp,
+
+    [Parameter(ParameterSetName = 'Instalar')]
     [switch]$SinWatchdog,
 
     [Parameter(ParameterSetName = 'Instalar')]
@@ -123,6 +138,9 @@ param(
 
     [Parameter(ParameterSetName = 'Desinstalar')]
     [switch]$BorrarClaves,
+
+    [Parameter(ParameterSetName = 'Desinstalar')]
+    [switch]$QuitarWireGuard,
 
     [Parameter(ParameterSetName = 'Estado', Mandatory = $true)]
     [switch]$Estado,
@@ -139,7 +157,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$VERSION      = '1.1'
+$VERSION      = '1.2'
 $WG_HOME      = Join-Path $env:ProgramFiles 'WireGuard'
 $WG_EXE       = Join-Path $WG_HOME 'wireguard.exe'
 $WG_CLI       = Join-Path $WG_HOME 'wg.exe'
@@ -298,6 +316,59 @@ function Obtener-Claves {
         Publica = (Get-Content $fPub  -Raw).Trim()
         Psk     = (Get-Content $fPsk  -Raw).Trim()
         Dir     = $dirClaves
+    }
+}
+
+# --------------------------------------------------------------- firewall
+
+# Windows descarta el echo request entrante por defecto en perfil Publico, y el
+# adaptador del tunel casi siempre cae en Publico. Por eso el hub puede tener
+# todo bien y el ping a la PC igual da timeout.
+#
+# La regla se acota por partida doble: solo por el adaptador del tunel y solo
+# desde los prefijos de AllowedIPs. No se abre nada hacia la red local ni hacia
+# Internet, y no se toca ninguna otra regla del equipo.
+function Configurar-FirewallIcmp {
+    param([string[]]$Remotos)
+
+    $regla = "WG-$Nombre-ICMP-IN"
+
+    if ($DryRun) {
+        Write-Host "[dry-run] crearia la regla de firewall $regla para: $($Remotos -join ', ')" -ForegroundColor DarkGray
+        return
+    }
+
+    if (Get-NetFirewallRule -Name $regla -ErrorAction SilentlyContinue) {
+        Remove-NetFirewallRule -Name $regla -ErrorAction SilentlyContinue
+    }
+
+    $comun = @{
+        Name        = $regla
+        DisplayName = "WireGuard $Nombre - permitir ping desde el tunel"
+        Description = "Creada por instalar-wg-windows.ps1 v$VERSION. Acepta echo request solo por $Nombre y solo desde los prefijos de AllowedIPs."
+        Direction   = 'Inbound'
+        Action      = 'Allow'
+        Protocol    = 'ICMPv4'
+        IcmpType    = 8
+        RemoteAddress = $Remotos
+        Profile     = 'Any'
+        Enabled     = 'True'
+    }
+
+    try {
+        New-NetFirewallRule @comun -InterfaceAlias $Nombre -ErrorAction Stop | Out-Null
+        Ok "Firewall: '$regla' acepta ping por $Nombre desde $($Remotos -join ', ')"
+    }
+    catch {
+        # Si el filtro por adaptador no se puede aplicar, la regla sigue siendo
+        # segura: el filtro por direccion de origen ya la limita al tunel.
+        try {
+            New-NetFirewallRule @comun -ErrorAction Stop | Out-Null
+            Aviso "Firewall: '$regla' creada sin filtro por adaptador. Queda acotada por origen: $($Remotos -join ', ')"
+        }
+        catch {
+            Aviso "No se pudo crear la regla de firewall: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -461,6 +532,20 @@ function Mostrar-Estado {
     & sc.exe qfailure $svcName 2>&1 | Select-Object -Skip 1
 
     Write-Host ''
+    Write-Host '--- firewall (ping entrante por el tunel) ---' -ForegroundColor Cyan
+    $regla = "WG-$Nombre-ICMP-IN"
+    $fw = Get-NetFirewallRule -Name $regla -ErrorAction SilentlyContinue
+    if ($fw) {
+        $orig = ($fw | Get-NetFirewallAddressFilter).RemoteAddress
+        Write-Host ("  regla   : {0} ({1})" -f $regla, $fw.Enabled)
+        Write-Host ("  origenes: {0}" -f ($orig -join ', '))
+    }
+    else {
+        Write-Host "  No hay regla de ping entrante. Windows va a descartar los ping del hub y del SCADA."
+        Write-Host "  Para habilitarlo, reinstala agregando -PermitirIcmp"
+    }
+
+    Write-Host ''
     Write-Host '--- watchdog ---' -ForegroundColor Cyan
     $tarea = Get-ScheduledTask -TaskName "wg-watchdog-$Nombre" -ErrorAction SilentlyContinue
     if ($tarea) {
@@ -500,6 +585,16 @@ function Desinstalar-Tunel {
     $fWatch = Join-Path $DATA_DIR 'watchdog.ps1'
     if (Test-Path $fWatch) { Ejecutar "borrar $fWatch" { Remove-Item $fWatch -Force } }
 
+    # Si se creo la regla de ping hay que sacarla: dejarla apuntando a un
+    # adaptador que ya no existe es basura silenciosa que nadie va a revisar.
+    $regla = "WG-$Nombre-ICMP-IN"
+    if (Get-NetFirewallRule -Name $regla -ErrorAction SilentlyContinue) {
+        Ejecutar "borrar la regla de firewall $regla" {
+            Remove-NetFirewallRule -Name $regla
+        }
+        Ok "Regla de firewall $regla eliminada."
+    }
+
     if (-not (Test-Path $WG_EXE)) {
         Aviso 'WireGuard no esta instalado; no hay servicio de tunel que dar de baja.'
     }
@@ -536,8 +631,65 @@ function Desinstalar-Tunel {
         Info "Las claves se conservan en $(Join-Path $DATA_DIR 'claves')"
     }
 
+    if ($QuitarWireGuard) { Quitar-WireGuard }
+
     Ok "Tunel $Nombre desinstalado."
     exit 0
+}
+
+# Solo para equipos de prueba: deja la PC como estaba antes de todo.
+function Quitar-WireGuard {
+    Aviso 'Se desinstala el cliente WireGuard y se borra el directorio de datos.'
+
+    # Si quedara otro tunel configurado, desinstalar el programa lo dejaria
+    # huerfano. Mejor avisar y no hacerlo a ciegas.
+    $otros = @(Get-Service -Name 'WireGuardTunnel$*' -ErrorAction SilentlyContinue)
+    if ($otros.Count -gt 0) {
+        Aviso "Quedan otros tuneles en este equipo: $($otros.Name -join ', ')"
+        Aviso 'No se desinstala WireGuard para no dejarlos sin cliente. Bajalos primero.'
+        return
+    }
+
+    if (Test-Path $DATA_DIR) {
+        Ejecutar "borrar $DATA_DIR" { Remove-Item $DATA_DIR -Recurse -Force }
+    }
+
+    if (-not (Test-Path $WG_EXE)) {
+        Info 'El cliente WireGuard ya no esta instalado.'
+        return
+    }
+
+    if ($DryRun) { Write-Host '[dry-run] desinstalaria el cliente WireGuard' -ForegroundColor DarkGray; return }
+
+    $listo = $false
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        Info 'Desinstalando WireGuard por winget.'
+        & winget.exe uninstall --id WireGuard.WireGuard -e --silent 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        $listo = -not (Test-Path $WG_EXE)
+    }
+
+    if (-not $listo) {
+        # WireGuard se instala por MSI, asi que el nombre de la clave de registro
+        # es el ProductCode y alcanza con pasarselo a msiexec.
+        $rutas = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        $app = Get-ItemProperty $rutas -ErrorAction SilentlyContinue |
+               Where-Object { $_.DisplayName -like 'WireGuard*' } |
+               Select-Object -First 1
+        if ($app -and $app.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
+            Info "Desinstalando por msiexec ($($app.PSChildName))."
+            $p = Start-Process msiexec.exe -ArgumentList @('/x', $app.PSChildName, '/qn', '/norestart') -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Aviso "msiexec devolvio $($p.ExitCode)." }
+            Start-Sleep -Seconds 3
+            $listo = -not (Test-Path $WG_EXE)
+        }
+    }
+
+    if ($listo) { Ok 'Cliente WireGuard desinstalado.' }
+    else { Aviso "No se pudo desinstalar WireGuard solo. Sacalo desde Configuracion > Aplicaciones." }
 }
 
 # ==================================================================== main
@@ -622,7 +774,11 @@ else {
 
 Info "Se instalaran $($allowed.Count) rutas especificas por $Nombre :"
 foreach ($a in ($allowed | Select-Object -Unique)) { Write-Host "      $a" }
-Info 'El resto del trafico de la PC no se toca. No se modifica el Firewall de Windows.'
+if ($PermitirIcmp) {
+    Info 'El resto del trafico de la PC no se toca. Del firewall se agrega solo una regla de ping entrante.'
+} else {
+    Info 'El resto del trafico de la PC no se toca. No se modifica el Firewall de Windows.'
+}
 
 # --- registrar el servicio ----------------------------------------------
 
@@ -655,6 +811,10 @@ if (-not $DryRun) {
 }
 
 Configurar-Persistencia
+
+if ($PermitirIcmp) {
+    Configurar-FirewallIcmp -Remotos @($allowed | Select-Object -Unique)
+}
 
 # --- salida --------------------------------------------------------------
 

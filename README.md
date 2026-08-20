@@ -96,3 +96,111 @@ Una comprobación que no se pudo hacer **no** es una comprobación superada. Si
 falta el privilegio o la herramienta, el script lo marca `[ n/d ]` y lo repite en
 el resumen final, en vez de contarlo como correcto. Un OK falso en un chequeo
 previo es peor que no haberlo corrido.
+
+## instalar-wg-windows.ps1
+
+Instalador desatendido del cliente WireGuard para una PC Windows contra el hub.
+Equivalente del instalador de Linux: instala el cliente si falta, genera o
+reutiliza las claves, escribe el `.conf`, registra el túnel como servicio y lo
+deja arrancando solo.
+
+Necesita PowerShell 5.1 o superior, **abierto como Administrador**.
+
+```powershell
+.\instalar-wg-windows.ps1 -IpOverlay 10.255.0.20/32 -HubPubkey 'CLAVE_DEL_HUB=' -HubEndpoint 1.2.3.4:51820 -RedesReco 10.20.1.0/24 -RoutersReco 10.255.1.1 -PermitirIcmp
+.\instalar-wg-windows.ps1 -Estado
+.\instalar-wg-windows.ps1 -Desinstalar -BorrarClaves -QuitarWireGuard
+```
+
+Al terminar imprime el bloque del peer listo para pegar en el RouterOS del hub.
+Con `-Breve` imprime sólo la clave pública y la PSK, para copiar de una pasada.
+
+### Política de ruteo
+
+Prefijos estrictos: nada de `0.0.0.0/0`, nada más ancho que `/24`. En Windows
+**cada entrada de `AllowedIPs` es una ruta** que el cliente instala sola; no se
+ejecuta ningún `route add`. Por eso un prefijo ancho no "abre" nada en el hub
+pero sí secuestra el ruteo de la PC, y un `0.0.0.0/0` dejaría al operador sin
+internet y sin RDP. El script se niega a ambos.
+
+El resto del tráfico —internet, LAN local, impresoras— queda intacto.
+
+### Persistencia
+
+En Linux el túnel vive en el kernel: una vez levantada la interfaz no hay
+proceso que se pueda morir. En Windows el túnel **es** un servicio de usuario, y
+hay tres fallas distintas que cubrir:
+
+| Falla | Qué la cubre |
+|---|---|
+| Reboot | `StartType Automatic`, verificado después de instalar |
+| El servicio se cae | `sc.exe failure`: reintenta a los 5 s, 15 s y 60 s |
+| Corriendo pero mudo | Watchdog como tarea programada, cada 5 min |
+
+El tercero es el que no cubre ningún mecanismo nativo: el servicio puede seguir
+en `Running` con el túnel muerto —típico al suspender la PC o cambiar de red— y
+para Windows eso es un servicio sano. El watchdog mira la antigüedad del último
+handshake, no el estado del servicio.
+
+Detalle que hace la diferencia: el `sc.exe failureflag 1`. Sin él Windows sólo
+dispara la recuperación cuando el servicio *crashea*, y el túnel de WireGuard
+normalmente termina con salida limpia y código de error.
+
+El watchdog no hace nada si la PC no tiene ninguna red conectada. Sin
+conectividad el handshake va a fallar igual, y reciclar el servicio en bucle
+sólo tira el adaptador abajo.
+
+### -PermitirIcmp
+
+Windows descarta el echo request entrante por defecto en perfil Público, y el
+adaptador del túnel casi siempre cae en Público. Por eso el hub puede tener todo
+bien configurado y el ping a la PC igual dar timeout.
+
+Con `-PermitirIcmp` se crea una regla de entrada acotada por partida doble: sólo
+por el adaptador del túnel y sólo desde los prefijos de `AllowedIPs`. Es lo
+único que el script toca del Firewall de Windows, y sólo si se lo pide
+explícitamente. `-Desinstalar` la remueve.
+
+## bootstrap-wg-windows.ps1
+
+Punto de entrada para que el cliente pegue **una sola línea**. Baja
+`instalar-wg-windows.ps1` del repositorio y le pasa todos los argumentos tal
+cual, así que no necesita mantenerse sincronizado con sus parámetros.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/esteban826/nets/main/bootstrap-wg-windows.ps1))) -IpOverlay 10.255.0.20/32 -HubPubkey 'CLAVE_DEL_HUB=' -HubEndpoint 1.2.3.4:51820 -RedesReco 10.20.1.0/24 -RoutersReco 10.255.1.1 -PermitirIcmp
+```
+
+Verifica que sea Administrador antes de bajar nada, comprueba que lo descargado
+sea realmente el instalador —un repositorio renombrado o privado devuelve una
+página HTML con código 200— y borra el temporal al terminar.
+
+Una línea sola no es capricho: en PowerShell el pegado de varias líneas se
+ejecuta fuera de orden con más frecuencia de la que uno esperaría.
+
+## ajustar-allowed-ips.sh
+
+Agrega o quita entradas de `AllowedIPs` en un cliente wg-quick **sin reiniciar
+el túnel**.
+
+```bash
+sudo bash ajustar-allowed-ips.sh --listar
+sudo bash ajustar-allowed-ips.sh --agregar 10.255.0.20/32
+sudo bash ajustar-allowed-ips.sh --agregar 10.20.2.0/24,10.255.2.1 --dry-run
+sudo bash ajustar-allowed-ips.sh --quitar 10.20.2.0/24
+```
+
+Aplica el cambio en tres lugares, que es donde suele romperse la cosa a mano:
+
+| | |
+|---|---|
+| En caliente | `wg set` sobre el peer. **Reemplaza la lista completa**, no agrega: el script lee la actual y manda la nueva entera |
+| Las rutas | `wg set` no las toca. Al levantar, wg-quick las deriva de `AllowedIPs`; en caliente hay que reconciliarlas aparte |
+| En disco | Reescribe el `.conf` con backup previo, para que sobreviva al reinicio |
+
+Al final compara memoria contra disco. Los dos modos de quedar a medias
+—aplicado sin persistir, o persistido sin aplicar— se ven idénticos desde afuera
+hasta que reiniciás el servidor o hasta que probás el tráfico.
+
+Misma política de prefijos que el instalador de Windows: rechaza `0.0.0.0/0` y
+todo lo más ancho que `/24`. Una IP sin máscara se toma como `/32`.
