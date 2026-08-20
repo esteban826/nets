@@ -59,6 +59,13 @@
 .PARAMETER MsiPath
     Ruta a un MSI de WireGuard ya descargado, para equipos sin salida a internet.
 
+.PARAMETER SinWatchdog
+    No instala la tarea programada de vigilancia. El servicio igual queda en
+    arranque automatico y con acciones de recuperacion.
+
+.PARAMETER WatchdogMinutos
+    Cada cuantos minutos corre el watchdog. Por defecto 5.
+
 .PARAMETER DryRun
     Muestra lo que haria sin tocar nada.
 
@@ -104,6 +111,13 @@ param(
     [Parameter(ParameterSetName = 'Instalar')]
     [switch]$Breve,
 
+    [Parameter(ParameterSetName = 'Instalar')]
+    [switch]$SinWatchdog,
+
+    [Parameter(ParameterSetName = 'Instalar')]
+    [ValidateRange(1, 60)]
+    [int]$WatchdogMinutos = 5,
+
     [Parameter(ParameterSetName = 'Desinstalar', Mandatory = $true)]
     [switch]$Desinstalar,
 
@@ -125,7 +139,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$VERSION      = '1.0'
+$VERSION      = '1.1'
 $WG_HOME      = Join-Path $env:ProgramFiles 'WireGuard'
 $WG_EXE       = Join-Path $WG_HOME 'wireguard.exe'
 $WG_CLI       = Join-Path $WG_HOME 'wg.exe'
@@ -287,6 +301,133 @@ function Obtener-Claves {
     }
 }
 
+# ------------------------------------------------------------ persistencia
+
+# En Linux el tunel vive en el kernel: una vez levantada la interfaz no hay
+# proceso que se pueda morir. En Windows el tunel ES un servicio de usuario,
+# asi que hay tres cosas distintas que asegurar:
+#   1. que arranque solo despues de un reboot   -> StartType Automatic
+#   2. que se levante solo si se cae            -> acciones de recuperacion
+#   3. que se recicle si queda "corriendo pero mudo" -> watchdog
+# El caso 3 es el que no cubre ningun mecanismo nativo: el servicio puede
+# seguir en Running con el tunel muerto (tipico despues de suspender la PC o
+# de cambiar de red), y para Windows eso es un servicio sano.
+
+function Escribir-Watchdog {
+    param([string]$Ruta, [string]$Tunel)
+
+    $cuerpo = @'
+# Watchdog del tunel WireGuard. Lo instala instalar-wg-windows.ps1.
+$ErrorActionPreference = 'SilentlyContinue'
+
+$tunel = '__NOMBRE__'
+$svc   = "WireGuardTunnel`$$tunel"
+$wg    = Join-Path $env:ProgramFiles 'WireGuard\wg.exe'
+$log   = Join-Path $env:ProgramData 'wg-scada\watchdog.log'
+
+function Registrar([string]$m) {
+    Add-Content -Path $log -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
+    if ((Test-Path $log) -and (Get-Item $log).Length -gt 512KB) {
+        $cola = Get-Content $log -Tail 500
+        Set-Content -Path $log -Value $cola
+    }
+}
+
+$s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+if (-not $s) { exit 0 }
+
+if ($s.Status -ne 'Running') {
+    Registrar "servicio en estado $($s.Status): se arranca"
+    Start-Service -Name $svc
+    exit 0
+}
+
+# Con PersistentKeepalive el handshake se renueva cada ~2 minutos. Si hace mas
+# de 3 no hubo ninguno, el tunel esta muerto aunque el servicio siga en Running.
+if (-not (Test-Path $wg)) { exit 0 }
+$salida = & $wg show $tunel latest-handshakes 2>$null
+if (-not $salida) { exit 0 }
+$campos = (@($salida)[0] -split "`t")
+if ($campos.Count -lt 2) { exit 0 }
+try { $ultimo = [int64]$campos[1].Trim() } catch { exit 0 }
+
+$edad = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $ultimo
+if ($ultimo -ne 0 -and $edad -le 180) { exit 0 }
+
+# Si la PC no tiene ninguna red conectada, reciclar el tunel no arregla nada:
+# el handshake va a fallar igual y solo se estaria tirando el adaptador abajo
+# en loop. Se espera a que vuelva la conectividad.
+$hayRed = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -ne $tunel }).Count -gt 0
+if (-not $hayRed) { exit 0 }
+
+Registrar "sin handshake hace $edad s: se reinicia $svc"
+Restart-Service -Name $svc -Force
+'@
+
+    $cuerpo.Replace('__NOMBRE__', $Tunel) | Set-Content -Path $Ruta -Encoding ASCII
+}
+
+function Configurar-Persistencia {
+    $svcName = "WireGuardTunnel`$$Nombre"
+    $tarea   = "wg-watchdog-$Nombre"
+
+    if ($DryRun) {
+        Write-Host "[dry-run] configuraria arranque automatico, recuperacion y tarea $tarea" -ForegroundColor DarkGray
+        return
+    }
+
+    # 1. arranque automatico
+    Set-Service -Name $svcName -StartupType Automatic
+    $st = (Get-Service -Name $svcName).StartType
+    if ($st -ne 'Automatic') { Aviso "El servicio quedo con arranque $st, no Automatic. Revisalo a mano." }
+    else { Ok "Servicio $svcName con arranque automatico." }
+
+    # 2. acciones de recuperacion. El 'failureflag 1' es imprescindible: sin el,
+    # Windows solo dispara la recuperacion cuando el servicio crashea, y el
+    # tunel de WireGuard normalmente termina con salida limpia y codigo de error.
+    & sc.exe failure $svcName reset= 0 actions= restart/5000/restart/15000/restart/60000 | Out-Null
+    & sc.exe failureflag $svcName 1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Ok 'Recuperacion automatica configurada (reintenta a los 5s, 15s y 60s).' }
+    else { Aviso "sc.exe failure devolvio $LASTEXITCODE. El servicio no reintentara solo." }
+
+    # 3. watchdog
+    if ($SinWatchdog) {
+        Aviso 'Watchdog omitido por -SinWatchdog. Si el tunel queda mudo sin caerse el servicio, nadie lo va a reciclar.'
+        return
+    }
+
+    $fWatch = Join-Path $DATA_DIR 'watchdog.ps1'
+    Escribir-Watchdog -Ruta $fWatch -Tunel $Nombre
+
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $accion = New-ScheduledTaskAction -Execute $psExe `
+        -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$fWatch`""
+
+    $trArranque = New-ScheduledTaskTrigger -AtStartup
+    try { $trArranque.Delay = 'PT1M' } catch { }
+
+    # Sin -RepetitionDuration la repeticion queda indefinida, que es lo que se
+    # busca: el watchdog tiene que seguir corriendo para siempre.
+    $trCiclo = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes $WatchdogMinutos)
+
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+    # En una notebook los defaults de tarea programada la suspenden al pasar a
+    # bateria. Para un tunel de supervision eso es justo lo que no se quiere.
+    $opciones = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -StartWhenAvailable `
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+    Register-ScheduledTask -TaskName $tarea -Action $accion `
+        -Trigger @($trArranque, $trCiclo) -Principal $principal `
+        -Settings $opciones -Force | Out-Null
+
+    Restringir-Acl $DATA_DIR
+    Ok "Watchdog instalado: tarea '$tarea' cada $WatchdogMinutos min y en cada arranque."
+}
+
 # ------------------------------------------------------------------ estado
 
 function Mostrar-Estado {
@@ -312,8 +453,33 @@ function Mostrar-Estado {
     }
 
     Write-Host '--- servicio ---' -ForegroundColor Cyan
-    Get-Service -Name "WireGuardTunnel`$$Nombre" -ErrorAction SilentlyContinue |
+    $svcName = "WireGuardTunnel`$$Nombre"
+    Get-Service -Name $svcName -ErrorAction SilentlyContinue |
         Format-Table Name, Status, StartType -AutoSize
+
+    Write-Host '--- recuperacion automatica ---' -ForegroundColor Cyan
+    & sc.exe qfailure $svcName 2>&1 | Select-Object -Skip 1
+
+    Write-Host ''
+    Write-Host '--- watchdog ---' -ForegroundColor Cyan
+    $tarea = Get-ScheduledTask -TaskName "wg-watchdog-$Nombre" -ErrorAction SilentlyContinue
+    if ($tarea) {
+        $info = Get-ScheduledTaskInfo -TaskName "wg-watchdog-$Nombre" -ErrorAction SilentlyContinue
+        Write-Host ("  tarea      : wg-watchdog-{0} ({1})" -f $Nombre, $tarea.State)
+        if ($info) {
+            Write-Host ("  ultima vez : {0} (resultado {1})" -f $info.LastRunTime, $info.LastTaskResult)
+            Write-Host ("  proxima    : {0}" -f $info.NextRunTime)
+        }
+        $logW = Join-Path $DATA_DIR 'watchdog.log'
+        if (Test-Path $logW) {
+            Write-Host '  ultimas intervenciones:'
+            Get-Content $logW -Tail 5 | ForEach-Object { Write-Host "    $_" }
+        }
+        else { Write-Host '  sin intervenciones registradas (el tunel nunca necesito ayuda).' }
+    }
+    else {
+        Aviso "No hay watchdog instalado para $Nombre."
+    }
     exit 0
 }
 
@@ -321,6 +487,18 @@ function Mostrar-Estado {
 
 function Desinstalar-Tunel {
     Info "Desinstalando el tunel $Nombre."
+
+    # El watchdog se saca primero. Si se baja el servicio con la tarea todavia
+    # viva, el watchdog lo vuelve a levantar y la desinstalacion se pelea sola.
+    $tarea = "wg-watchdog-$Nombre"
+    if (Get-ScheduledTask -TaskName $tarea -ErrorAction SilentlyContinue) {
+        Ejecutar "borrar la tarea programada $tarea" {
+            Unregister-ScheduledTask -TaskName $tarea -Confirm:$false
+        }
+        Ok "Watchdog $tarea eliminado."
+    }
+    $fWatch = Join-Path $DATA_DIR 'watchdog.ps1'
+    if (Test-Path $fWatch) { Ejecutar "borrar $fWatch" { Remove-Item $fWatch -Force } }
 
     if (-not (Test-Path $WG_EXE)) {
         Aviso 'WireGuard no esta instalado; no hay servicio de tunel que dar de baja.'
@@ -473,8 +651,10 @@ if (-not $DryRun) {
     if ($svc.Status -ne 'Running') {
         Morir "El servicio del tunel quedo en estado $($svc.Status). Revisa el log en $WG_HOME\Data\log.bin desde la GUI."
     }
-    Ok "Servicio WireGuardTunnel`$$Nombre en ejecucion y con arranque automatico."
+    Ok "Servicio WireGuardTunnel`$$Nombre en ejecucion."
 }
+
+Configurar-Persistencia
 
 # --- salida --------------------------------------------------------------
 
